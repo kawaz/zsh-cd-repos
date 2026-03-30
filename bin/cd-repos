@@ -6,7 +6,7 @@ set -euo pipefail
 REPOS="${XDG_DATA_HOME:-$HOME/.local/share}/repos"
 
 cmd_list() {
-  cd "$REPOS" && ls -ltd --time-style='+%Y-%m-%dT%H:%M:%S' ./*/*/*/ 2>/dev/null | while read -r _ _ _ _ _ ts d; do
+  cd "$REPOS" && ls -ltd --time-style='+%Y-%m-%dT%H:%M:%S' ./*/*/*/ ./*/*/*/*/ 2>/dev/null | while read -r _ _ _ _ _ ts d; do
     d="${d%/}"  # remove trailing slash
     [[ -e "$d/.git" || -d "$d/.jj" ]] || continue
 
@@ -19,13 +19,15 @@ cmd_list() {
     fi
 
     # 2文字マーク: 1文字目=Git, 2文字目=jj
-    # Git: G=実体, W=worktree, -=なし
+    # Git: B=bare, G=実体, W=worktree, -=なし
     # jj:  J=実体, W=workspace, -=なし
     local git_mark jj_mark
-    if [[ -d "$d/.git" ]]; then
+    if [[ -d "$d/.git" ]] && grep -q 'bare = true' "$d/.git/config" 2>/dev/null; then
+      git_mark="\033[34mB\033[0m"  # blue: bare git repo
+    elif [[ -d "$d/.git" ]]; then
       git_mark="\033[34mG\033[0m"  # blue: git repo
     elif [[ -f "$d/.git" ]]; then
-      git_mark="\033[35mW\033[0m"  # magenta: git worktree (blue+R)
+      git_mark="\033[35mW\033[0m"  # magenta: git worktree
     else
       git_mark="\033[90m-\033[0m"  # gray: no git
     fi
