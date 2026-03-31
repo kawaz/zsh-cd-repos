@@ -1,156 +1,421 @@
-#!/bin/bash
-# cd-repos: リポジトリ移動コマンド
+#!/bin/sh
+':' //; b=$(command -v bun) && exec "$b" --bun "$0" "$@"; exec node "$0" "$@"
+// src/list.ts
+import { readdirSync, lstatSync, readlinkSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
-set -euo pipefail
+// src/repos.ts
+import { resolve } from "node:path";
+var REPOS = process.env["XDG_DATA_HOME"] ? resolve(process.env["XDG_DATA_HOME"], "repos") : resolve(process.env["HOME"] ?? "/", ".local/share/repos");
 
-REPOS="${XDG_DATA_HOME:-$HOME/.local/share}/repos"
-
-cmd_list() {
-  cd "$REPOS" && ls -ltd --time-style='+%Y-%m-%dT%H:%M:%S' ./*/*/*/ ./*/*/*/*/ 2>/dev/null | while read -r _ _ _ _ _ ts d; do
-    d="${d%/}"  # remove trailing slash
-    [[ -e "$d/.git" || -d "$d/.jj" ]] || continue
-
-    local p="${d#./}"
-    local color="\033[34m"  # blue for directory
-    local link=""
-    if [[ -L "$d" ]]; then
-      color="\033[36m"  # cyan for symlink
-      link=" -> $(readlink "$d")"
-    fi
-
-    # 2文字マーク: 1文字目=Git, 2文字目=jj
-    # Git: B=bare, G=実体, W=worktree, -=なし
-    # jj:  J=実体, W=workspace, -=なし
-    local git_mark jj_mark
-    if [[ -d "$d/.git" ]] && grep -q 'bare = true' "$d/.git/config" 2>/dev/null; then
-      git_mark="\033[34mB\033[0m"  # blue: bare git repo
-    elif [[ -d "$d/.git" ]]; then
-      git_mark="\033[34mG\033[0m"  # blue: git repo
-    elif [[ -f "$d/.git" ]]; then
-      git_mark="\033[35mW\033[0m"  # magenta: git worktree
-    else
-      git_mark="\033[90m-\033[0m"  # gray: no git
-    fi
-    if [[ -d "$d/.jj/repo" ]]; then
-      jj_mark="\033[32mJ\033[0m"  # green: jj repo
-    elif [[ -e "$d/.jj/repo" ]]; then
-      jj_mark="\033[33mW\033[0m"  # yellow: jj workspace (green+R)
-    else
-      jj_mark="\033[90m-\033[0m"  # gray: no jj
-    fi
-    echo -e "${git_mark}${jj_mark} $ts ${color}$p${link}\033[0m"
-  done
+// src/list.ts
+function formatTimestamp(d) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+var c = {
+  blue: (s) => `\x1B[34m${s}\x1B[0m`,
+  magenta: (s) => `\x1B[35m${s}\x1B[0m`,
+  cyan: (s) => `\x1B[36m${s}\x1B[0m`,
+  green: (s) => `\x1B[32m${s}\x1B[0m`,
+  yellow: (s) => `\x1B[33m${s}\x1B[0m`,
+  gray: (s) => `\x1B[90m${s}\x1B[0m`
+};
+function detectGitMark(dir) {
+  const gitPath = join(dir, ".git");
+  try {
+    const st = lstatSync(gitPath);
+    if (st.isDirectory()) {
+      try {
+        const config = readFileSync(join(gitPath, "config"), "utf-8");
+        if (config.includes("bare = true"))
+          return "B";
+      } catch {}
+      return "G";
+    }
+    if (st.isFile())
+      return "W";
+  } catch {}
+  return "-";
+}
+function detectJjMark(dir) {
+  const jjRepo = join(dir, ".jj", "repo");
+  try {
+    const st = lstatSync(jjRepo);
+    if (st.isDirectory())
+      return "J";
+    return "W";
+  } catch {}
+  return "-";
+}
+function colorGitMark(m) {
+  switch (m) {
+    case "B":
+      return c.blue("B");
+    case "G":
+      return c.blue("G");
+    case "W":
+      return c.magenta("W");
+    default:
+      return c.gray("-");
+  }
+}
+function colorJjMark(m) {
+  switch (m) {
+    case "J":
+      return c.green("J");
+    case "W":
+      return c.yellow("W");
+    default:
+      return c.gray("-");
+  }
+}
+function discoverRepos() {
+  const entries = [];
+  let hosts;
+  try {
+    hosts = readdirSync(REPOS);
+  } catch {
+    return entries;
+  }
+  for (const host of hosts) {
+    const hostDir = join(REPOS, host);
+    let orgs;
+    try {
+      orgs = readdirSync(hostDir);
+    } catch {
+      continue;
+    }
+    for (const org of orgs) {
+      const orgDir = join(hostDir, org);
+      let repos;
+      try {
+        repos = readdirSync(orgDir);
+      } catch {
+        continue;
+      }
+      for (const repo of repos) {
+        const repoDir = join(orgDir, repo);
+        const relPath = `${host}/${org}/${repo}`;
+        const gitMark3 = detectGitMark(repoDir);
+        const jjMark3 = detectJjMark(repoDir);
+        if (gitMark3 !== "-" || jjMark3 !== "-") {
+          const ls = lstatSync(repoDir);
+          entries.push({
+            path: relPath,
+            mtime: ls.mtime,
+            repoBase: relPath,
+            isParent: true,
+            gitMark: gitMark3,
+            jjMark: jjMark3,
+            isSymlink: ls.isSymbolicLink(),
+            linkTarget: ls.isSymbolicLink() ? readlinkSync(repoDir) : undefined
+          });
+        }
+        let children;
+        try {
+          children = readdirSync(repoDir);
+        } catch {
+          continue;
+        }
+        for (const child of children) {
+          const childDir = join(repoDir, child);
+          const childRel = `${relPath}/${child}`;
+          const gitMarkC = detectGitMark(childDir);
+          const jjMarkC = detectJjMark(childDir);
+          if (gitMarkC === "-" && jjMarkC === "-")
+            continue;
+          const ls = lstatSync(childDir);
+          entries.push({
+            path: childRel,
+            mtime: ls.mtime,
+            repoBase: relPath,
+            isParent: false,
+            gitMark: gitMarkC,
+            jjMark: jjMarkC,
+            isSymlink: ls.isSymbolicLink(),
+            linkTarget: ls.isSymbolicLink() ? readlinkSync(childDir) : undefined
+          });
+        }
+      }
+    }
+  }
+  return entries;
+}
+function listEntries() {
+  const entries = discoverRepos();
+  const groupMaxMtime = new Map;
+  for (const e of entries) {
+    const cur = groupMaxMtime.get(e.repoBase) ?? 0;
+    const t = e.mtime.getTime();
+    if (t > cur)
+      groupMaxMtime.set(e.repoBase, t);
+  }
+  entries.sort((a, b) => {
+    const ga = groupMaxMtime.get(a.repoBase) ?? 0;
+    const gb = groupMaxMtime.get(b.repoBase) ?? 0;
+    if (ga !== gb)
+      return gb - ga;
+    if (a.repoBase !== b.repoBase)
+      return a.repoBase < b.repoBase ? -1 : 1;
+    if (a.isParent !== b.isParent)
+      return a.isParent ? 1 : -1;
+    return b.mtime.getTime() - a.mtime.getTime();
+  });
+  return entries;
+}
+function formatEntry(e) {
+  const ts = formatTimestamp(e.mtime);
+  const gm = colorGitMark(e.gitMark);
+  const jm = colorJjMark(e.jjMark);
+  const pathColor = e.isSymlink ? c.cyan : c.blue;
+  const link = e.linkTarget ? ` -> ${e.linkTarget}` : "";
+  return `${gm}${jm} ${ts} ${pathColor(e.path + link)}`;
+}
+async function cmdList() {
+  const entries = listEntries();
+  const lines = entries.map(formatEntry);
+  const out = lines.join(`
+`) + `
+`;
+  process.stdout.write(out);
 }
 
-cmd_preview() {
-  local line="$1"
-  # ANSI カラーコードを除去
-  line=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g')
-  local mark="${line%% *}"
-  local rest="${line#* }"
-  local p="${rest#* }"  # skip timestamp
-  p="${p%% -> *}"       # シンボリックリンク矢印以降を除去
-  local r="$REPOS/$p"
-
-  # jj repo check
-  if [[ -d "$r/.jj" ]]; then
-    # jj workspace の場合、実体リポジトリのパスを表示
-    if [[ -f "$r/.jj/repo" ]]; then
-      local jj_parent=$(cat "$r/.jj/repo")
-      echo "jj workspace of: ${jj_parent%/.jj/repo}"
-    fi
-    # 関連 bookmark の詳細 (@git, @origin 含む)
-    local related_bookmarks=$(jj -R "$r" log -r '@ | trunk()' --no-graph -T 'if(bookmarks, bookmarks ++ "\n")' --no-pager 2>/dev/null | sort -u)
-    if [[ -n $related_bookmarks ]]; then
-      echo "--- bookmarks ---"
-      echo "$related_bookmarks" | while read -r bm; do
-        [[ -n $bm ]] && jj -R "$r" bookmark list --all "$bm" --color=always --no-pager 2>/dev/null
-      done
-    fi
-    # trunk から @ までの直線1行表示
-    echo "--- jj ---"
-    # refs データを収集して色付け
-    # local: 35(マゼンタ), remote: 4;35(UL+マゼンタ)@4;2;35(UL+薄マゼンタ), tag: 31(赤), HEAD: 2;31(薄赤)
-    local refs_data=$(jj -R "$r" log -r 'trunk()::@' --no-graph --color=never --no-pager \
-      -T 'change_id.shortest(4) ++ "|" ++ local_bookmarks ++ "|" ++ remote_bookmarks.join(",") ++ "|" ++ tags.join(",") ++ "|" ++ if(git_head, "HEAD", "") ++ "\n"' 2>/dev/null | \
-      awk -F'|' '{
-        refs=""
-        # local_bookmarks: マゼンタ
-        if (length($2) > 0) refs=sprintf("\033[35m%s\033[0m", $2)
-        # remote_bookmarks: UL+マゼンタ @ UL+薄マゼンタ
-        if (length($3) > 0) {
-          n=split($3, rbs, ",")
-          for (i=1; i<=n; i++) {
-            if (length(refs) > 0) refs=refs ", "
-            if (match(rbs[i], /@/)) {
-              left=substr(rbs[i], 1, RSTART-1)
-              right=substr(rbs[i], RSTART)
-              refs=refs sprintf("\033[4;35m%s\033[0m\033[4;2;35m%s\033[0m", left, right)
-            } else {
-              refs=refs sprintf("\033[4;35m%s\033[0m", rbs[i])
-            }
+// src/preview.ts
+import { existsSync as existsSync2, readFileSync as readFileSync2, lstatSync as lstatSync2 } from "node:fs";
+import { join as join2 } from "node:path";
+import { execFileSync } from "node:child_process";
+function run(cmd, args, cwd) {
+  try {
+    return execFileSync(cmd, args, {
+      cwd,
+      encoding: "utf-8",
+      timeout: 5000,
+      env: { ...process.env, NO_COLOR: undefined }
+    }).trimEnd();
+  } catch {
+    return "";
+  }
+}
+function stripAnsi(s) {
+  return s.replace(/\x1b\[[0-9;]*m/g, "");
+}
+function parseLine(line) {
+  const clean = stripAnsi(line);
+  const rest = clean.slice(clean.indexOf(" ") + 1);
+  let p = rest.slice(rest.indexOf(" ") + 1);
+  p = p.replace(/ -> .*$/, "");
+  return p;
+}
+function previewJj(r) {
+  const jjRepoFile = join2(r, ".jj", "repo");
+  try {
+    const st = lstatSync2(jjRepoFile);
+    if (st.isFile()) {
+      const parent = readFileSync2(jjRepoFile, "utf-8").trim();
+      console.log(`jj workspace of: ${parent.replace(/\/.jj\/repo$/, "")}`);
+    }
+  } catch {}
+  const bookmarkOutput = run("jj", [
+    "-R",
+    r,
+    "log",
+    "-r",
+    "@ | trunk()",
+    "--no-graph",
+    "-T",
+    'if(bookmarks, bookmarks ++ "\\n")',
+    "--no-pager"
+  ]);
+  if (bookmarkOutput) {
+    const bookmarks = [...new Set(bookmarkOutput.split(`
+`).filter(Boolean))].sort();
+    if (bookmarks.length > 0) {
+      console.log("--- bookmarks ---");
+      for (const bm of bookmarks) {
+        const detail = run("jj", ["-R", r, "bookmark", "list", "--all", bm, "--color=always", "--no-pager"]);
+        if (detail)
+          console.log(detail);
+      }
+    }
+  }
+  console.log("--- jj ---");
+  const refsRaw = run("jj", [
+    "-R",
+    r,
+    "log",
+    "-r",
+    "trunk()::@",
+    "--no-graph",
+    "--color=never",
+    "--no-pager",
+    "-T",
+    'change_id.shortest(4) ++ "|" ++ local_bookmarks ++ "|" ++ remote_bookmarks.join(",") ++ "|" ++ tags.join(",") ++ "|" ++ if(git_head, "HEAD", "") ++ "\\n"'
+  ]);
+  const refsMap = new Map;
+  if (refsRaw) {
+    for (const line of refsRaw.split(`
+`).filter(Boolean)) {
+      const [changeId, local, remote, tags, head] = line.split("|");
+      const parts = [];
+      if (local)
+        parts.push(`\x1B[35m${local}\x1B[0m`);
+      if (remote) {
+        for (const rb of remote.split(",").filter(Boolean)) {
+          const atIdx = rb.indexOf("@");
+          if (atIdx >= 0) {
+            parts.push(`\x1B[4;35m${rb.slice(0, atIdx)}\x1B[0m\x1B[4;2;35m${rb.slice(atIdx)}\x1B[0m`);
+          } else {
+            parts.push(`\x1B[4;35m${rb}\x1B[0m`);
           }
         }
-        # tags: 赤
-        if (length($4) > 0) { if (length(refs) > 0) refs=refs ", "; refs=refs sprintf("\033[31m%s\033[0m", $4) }
-        # HEAD: 薄赤
-        if (length($5) > 0) { if (length(refs) > 0) refs=refs ", "; refs=refs sprintf("\033[1;3;31m%s\033[0m", $5) }
-        print $1 "|" refs
-      }')
-    # jj 色付き出力と refs を結合
-    paste -d$'\t' \
-      <(jj -R "$r" log -r 'trunk()::@' --no-graph --color=always --no-pager \
-        -T 'concat(committer.timestamp().format("%Y-%m-%dT%H:%M:%S%z"), if(current_working_copy, " @", "  "), " ", change_id.shortest(4), " ", commit_id.shortest(7), if(description, " " ++ description.first_line()), " (", author.name(), ")\n")' 2>/dev/null) \
-      <(echo "$refs_data") | \
-    while IFS=$'\t' read -r jj_line refs_line; do
-      local refs="${refs_line#*|}"
-      if [[ -n "$refs" ]]; then
-        echo -e "$jj_line ($refs)"
-      else
-        echo "$jj_line"
-      fi
-    done | head -8
-  fi
-
-  # git repo check
-  if [[ -e "$r/.git" ]]; then
-    # git worktree の場合、実体リポジトリのパスを表示
-    if [[ -f "$r/.git" ]]; then
-      local git_dir=$(sed 's/^gitdir: //' "$r/.git")
-      local git_parent="${git_dir%/.git/worktrees/*}"
-      echo "git worktree of: $git_parent"
-    fi
-    local branch=$(git -C "$r" branch --show-current 2>/dev/null)
-    local status=$(git -C "$r" status --short 2>/dev/null | cut -c1-2 | sort | uniq -c | awk '{print $2":"$1}' | tr '\n' ' ')
-    local wt_count=$(git -C "$r" worktree list 2>/dev/null | wc -l | tr -d ' ')
-    echo "Branch: $branch  ${status:-(clean)}  Worktrees: $wt_count"
-    echo "--- git log ---"
-    git -C "$r" tr --color=always -5 2>/dev/null
-  fi
+      }
+      if (tags)
+        parts.push(`\x1B[31m${tags}\x1B[0m`);
+      if (head)
+        parts.push(`\x1B[1;3;31m${head}\x1B[0m`);
+      if (changeId)
+        refsMap.set(changeId, parts.join(", "));
+    }
+  }
+  const logOutput = run("jj", [
+    "-R",
+    r,
+    "log",
+    "-r",
+    "trunk()::@",
+    "--no-graph",
+    "--color=always",
+    "--no-pager",
+    "-T",
+    'concat(committer.timestamp().format("%Y-%m-%dT%H:%M:%S%z"), if(current_working_copy, " @", "  "), " ", change_id.shortest(4), " ", commit_id.shortest(7), if(description, " " ++ description.first_line()), " (", author.name(), ")\\n")'
+  ]);
+  if (logOutput) {
+    const lines = logOutput.split(`
+`).filter(Boolean);
+    let count = 0;
+    for (const line of lines) {
+      if (count >= 8)
+        break;
+      const cleanLine = stripAnsi(line);
+      const match = cleanLine.match(/[@ ] ([a-z]{4,}) /);
+      const changeId = match?.[1];
+      const refs = changeId ? refsMap.get(changeId) : undefined;
+      if (refs) {
+        console.log(`${line} (${refs})`);
+      } else {
+        console.log(line);
+      }
+      count++;
+    }
+  }
+}
+function previewGit(r) {
+  const gitPath = join2(r, ".git");
+  try {
+    const st = lstatSync2(gitPath);
+    if (st.isFile()) {
+      const content = readFileSync2(gitPath, "utf-8").trim();
+      const gitDir = content.replace(/^gitdir: /, "");
+      const parent = gitDir.replace(/\/.git\/worktrees\/.*$/, "");
+      console.log(`git worktree of: ${parent}`);
+    }
+  } catch {}
+  const branch = run("git", ["-C", r, "branch", "--show-current"]);
+  const statusRaw = run("git", ["-C", r, "status", "--short"]);
+  let statusSummary = "(clean)";
+  if (statusRaw) {
+    const counts = new Map;
+    for (const line of statusRaw.split(`
+`).filter(Boolean)) {
+      const code = line.slice(0, 2);
+      counts.set(code, (counts.get(code) ?? 0) + 1);
+    }
+    statusSummary = [...counts.entries()].map(([k, v]) => `${k.trim()}:${v}`).join(" ");
+  }
+  const wtCount = run("git", ["-C", r, "worktree", "list"]).split(`
+`).filter(Boolean).length;
+  console.log(`Branch: ${branch}  ${statusSummary}  Worktrees: ${wtCount}`);
+  console.log("--- git log ---");
+  const log = run("git", ["-C", r, "tr", "--color=always", "-5"]);
+  if (log)
+    console.log(log);
+}
+async function cmdPreview(rawLine) {
+  const p = parseLine(rawLine);
+  const r = join2(REPOS, p);
+  if (existsSync2(join2(r, ".jj"))) {
+    previewJj(r);
+  }
+  if (existsSync2(join2(r, ".git"))) {
+    previewGit(r);
+  }
 }
 
-cmd_search() {
-  local self="$0"
-  local query="${1:-}"
-
-  local selected
-  selected=$(cmd_list | fzf --exact --no-mouse --select-1 --exit-0 --ansi --no-sort \
-    --query "$query" \
-    --preview "$self preview {}" \
-    --preview-window 'up,70%,wrap' \
-    --bind 'ctrl-/:toggle-preview' \
-  ) || return 0
-
-  # マーク・タイムスタンプ・シンボリックリンク矢印除去してパスのみ出力
-  local rest="${selected#* }"  # skip mark
-  local p="${rest#* }"          # skip timestamp
-  p="${p%% -> *}"               # シンボリックリンク矢印以降を除去
-  [[ -n $p ]] && echo "$REPOS/$p"
+// src/search.ts
+import { execFileSync as execFileSync2 } from "node:child_process";
+async function cmdSearch(query) {
+  const self = process.argv[1] ?? "cd-repos";
+  let listOutput = "";
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => {
+    listOutput += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+    return true;
+  };
+  await cmdList();
+  process.stdout.write = origWrite;
+  if (!listOutput.trim())
+    return;
+  let selected;
+  try {
+    selected = execFileSync2("fzf", [
+      "--exact",
+      "--no-mouse",
+      "--select-1",
+      "--exit-0",
+      "--ansi",
+      "--no-sort",
+      "--query",
+      query,
+      "--preview",
+      `${self} preview {}`,
+      "--preview-window",
+      "up,70%,wrap",
+      "--bind",
+      "ctrl-/:toggle-preview"
+    ], {
+      input: listOutput,
+      encoding: "utf-8",
+      timeout: 0,
+      stdio: ["pipe", "pipe", "inherit"]
+    }).trimEnd();
+  } catch {
+    return;
+  }
+  if (!selected)
+    return;
+  const rest = selected.slice(selected.indexOf(" ") + 1);
+  let p = rest.slice(rest.indexOf(" ") + 1);
+  p = p.replace(/ -> .*$/, "");
+  p = p.replace(/\x1b\[[0-9;]*m/g, "");
+  if (p) {
+    console.log(`${REPOS}/${p}`);
+  }
 }
 
-case ${1:-search} in
-  list)    cmd_list ;;
-  preview) cmd_preview "$2" ;;
-  search)  cmd_search "${2:-}" ;;
-  *)       echo "Usage: $0 {list|preview|search}" >&2; exit 1 ;;
-esac
+// src/cli.ts
+var [command = "search", ...args] = process.argv.slice(2);
+switch (command) {
+  case "list":
+    await cmdList();
+    break;
+  case "preview":
+    await cmdPreview(args[0] ?? "");
+    break;
+  case "search":
+    await cmdSearch(args[0] ?? "");
+    break;
+  default:
+    console.error(`Usage: cd-repos {list|preview|search}`);
+    process.exit(1);
+}
